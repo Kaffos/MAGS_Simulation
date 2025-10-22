@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import os.path as osp
 
 
 FT_TO_M = 0.3048
@@ -111,9 +112,11 @@ def run_simulation(
 
     Uses the 10k Porthos flight as primary timebase; loads CSVs from the script directory.
     """
-    script_dir = Path(__file__).resolve().parent
-    df10 = pd.read_csv(script_dir / 'MRT Porthos official Flight data 2023.csv')
-    df60 = pd.read_csv(script_dir / 'FlightData60k.csv')
+    scripts_dir = osp.dirname(__file__)
+    data_dir = osp.join(scripts_dir, 'flight_data')
+    df10 = pd.read_csv(data_dir + '\\MRT Porthos official Flight data 2023.csv')
+    df60 = pd.read_csv(data_dir + '\\FlightData60k.csv')
+
 
     # use 10k as timebase unless requested otherwise
     if use_10k:
