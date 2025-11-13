@@ -2,32 +2,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 import control as ct
 
-# =====================================================
-# 1) Continuous-time model using python-control
-#    (for design/tuning)
-# =====================================================
 
 # ----- Servo model (first-order) -----
-# G_servo(s) = 1 / (tau s + 1)
-tau = 0.15  # seconds (same idea as in your FirstOrderServo model)
+tau = 0.15  # this tau can be tuned 
 G_servo = ct.tf([1], [tau, 1])  # 1 / (tau s + 1)
 
 
 def make_pid_tf(kp, ki, kd):
     """
-    PID controller in transfer function form.
-    C(s) = Kp + Ki/s + Kd*s
-         = (Kd*s^2 + Kp*s + Ki) / s
+    PID controller tf is C(s) = (Kd*s^2 + Kp*s + Ki) / s
     """
     num = [kd, kp, ki]
-    den = [1, 0]   # 's'
+    den = [1, 0]   
     return ct.tf(num, den)
 
 
 def make_closed_loop(kp, ki, kd):
     """
-    Closed-loop transfer function from reference to servo angle.
-    T(s) = feedback(C(s)*G(s), 1)
+    Closed-loop tf is  T(s) = feedback(C(s)*G(s), 1)
     """
     C = make_pid_tf(kp, ki, kd)
     L = C * G_servo          # open-loop
@@ -36,10 +28,6 @@ def make_closed_loop(kp, ki, kd):
 
 
 def settling_time_from_response(t, y, tol=0.02):
-    """
-    Rough settling time for a step of magnitude 1.
-    First time after which |y-1| < tol forever.
-    """
     y_err = np.abs(y - 1.0)
     for i in range(len(t)):
         if np.all(y_err[i:] < tol):
@@ -49,8 +37,7 @@ def settling_time_from_response(t, y, tol=0.02):
 
 def tune_pid():
     """
-    Very simple grid search over PID gains using python-control
-    on the first-order servo model.
+    simple grid search over PID gains using python-control on the first-order servo model.
     Minimizes a cost combining settling time + overshoot.
     """
     kp_vals = np.linspace(0.2, 2.0, 10)
@@ -79,7 +66,7 @@ def tune_pid():
                     print(f"New best (continuous model): "
                           f"cost={best_cost:.3f}, kp={kp:.3f}, ki={ki:.3f}, kd={kd:.3f}")
 
-    print("\nBest PID (continuous model):", best_pid)
+    print("\nBest PID:", best_pid)
     return best_pid
 
 
@@ -103,12 +90,6 @@ def plot_continuous_step_response(kp, ki, kd):
     plt.tight_layout()
     plt.show()
 
-
-# =====================================================
-# 2) Discrete-time MAGS-style simulation
-#    (your FirstOrderServo + PID controller)
-# =====================================================
-
 def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
     """
     Discrete PID controller for simulation.
@@ -122,9 +103,8 @@ def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
 
 class FirstOrderServo:
     """
-    Simple first-order servo model in discrete time.
     angle[k+1] = angle[k] + rate * dt
-    where rate ~ (cmd - angle) / tau, limited by rate_limit.
+    where rate ~ (cmd - angle) / tau
     """
     def __init__(self, init_angle=0.0, tau=0.15, rate_limit=180.0):
         self.angle = float(init_angle)
@@ -139,35 +119,19 @@ class FirstOrderServo:
         return self.angle
 
 
-def get_commands_from_schedule(t, default_az, default_el, cmd_schedule=None):
-    """
-    cmd_schedule: optional list of (time, az_cmd, el_cmd)
-    Returns the commanded (az, el) at time t.
-    If no schedule is provided, uses default_az / default_el.
-    """
-    if cmd_schedule is None or len(cmd_schedule) == 0:
-        return default_az, default_el
-
-    az, el = default_az, default_el
-    for t_i, az_i, el_i in cmd_schedule:
-        if t >= t_i:
-            az, el = az_i, el_i
-        else:
-            break
-    return az, el
+def read_command(i, cmd_schedule):
+    az_i, el_i = cmd_schedule[i][0], cmd_schedule[i][1] 
+    return az_i, el_i
 
 
-def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
+def simulate(kp=0.8, ki=0.02, kd=0.05,
                       dt=0.05, sim_time=10.0,
-                      az_cmd=50.0, el_cmd=15.0,
+                      cmd_schedule = (0,0),
+                      cmd_fs=1,
                       angle_limits=(-90, 90),
                       dcmd_limit_per_step=5.0,
-                      cmd_schedule=None,
                       plot=True,
                       return_logs=False):
-    """
-    Discrete-time 2D (az, el) servo system with PID control.
-    """
 
     # Initialize servos
     servo_pan = FirstOrderServo(init_angle=0.0, tau=tau)
@@ -181,8 +145,11 @@ def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
     time_log = []
     az_log, el_log = [], []
     az_err_log, el_err_log = [], []
-    sp_az_log, sp_el_log = [], []   # NEW: commanded angles log
+    sp_az_log, sp_el_log = [], []  
 
+    # command period and cmd schedule initialization
+    cmd_prd = 1/cmd_fs
+    i=0
     # Commanded states (servo setpoints)
     az_cmd_state = servo_pan.angle
     el_cmd_state = servo_tilt.angle
@@ -192,10 +159,11 @@ def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
         curr_az = servo_pan.angle
         curr_el = servo_tilt.angle
 
-        # Get setpoints (constant or from schedule)
-        sp_az, sp_el = get_commands_from_schedule(
-            t, az_cmd, el_cmd, cmd_schedule
-        )
+        # Get setpoints 
+        if t!=0 and t % cmd_prd==0 and len(cmd_schedule) > i+1: # if our curr time is a multiple of our sampling period, then we update our command and read next item in the list of 
+            i=i+1
+
+        sp_az, sp_el = read_command(i, cmd_schedule)
 
         # PID control
         az_control, az_err, integral_az = pid_controller(
@@ -212,7 +180,7 @@ def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
         az_delta = np.clip(az_control, -dcmd_limit_per_step, dcmd_limit_per_step)
         el_delta = np.clip(el_control, -dcmd_limit_per_step, dcmd_limit_per_step)
 
-        # Update commanded angles (within limits)
+        # Update commanded angles 
         az_cmd_state = np.clip(az_cmd_state + az_delta,
                                angle_limits[0], angle_limits[1])
         el_cmd_state = np.clip(el_cmd_state + el_delta,
@@ -228,8 +196,8 @@ def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
         el_log.append(new_el)
         az_err_log.append(az_err)
         el_err_log.append(el_err)
-        sp_az_log.append(sp_az)   # NEW
-        sp_el_log.append(sp_el)   # NEW
+        sp_az_log.append(sp_az)   
+        sp_el_log.append(sp_el)   #
 
     # Convert to arrays
     time_log = np.asarray(time_log)
@@ -248,7 +216,7 @@ def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
         plt.plot(time_log, az_log, label='Current Azimuth (°)')
         plt.plot(time_log, el_log, label='Current Elevation (°)')
 
-        # Plot commanded signals (works for both constant & schedule)
+        # Plot commanded signals
         plt.plot(time_log, sp_az_log, '--', label='Commanded Azimuth (°)')
         plt.plot(time_log, sp_el_log, '--', label='Commanded Elevation (°)')
 
@@ -283,50 +251,26 @@ def simulate_discrete(kp=0.8, ki=0.02, kd=0.05,
 
     return None
 
-# =====================================================
-# 3) Main: design with control, then test in discrete sim
-# =====================================================
 
-if __name__ == "__main__":
-    # --- A) Tune PID on the continuous-time model using python-control ---
-    print("Tuning PID on continuous first-order servo model...")
-    best_kp, best_ki, best_kd = tune_pid()
 
-    # Plot continuous-time step response with best gains
-    #plot_continuous_step_response(best_kp, best_ki, best_kd)
 
-    # --- B) Use those same gains in the discrete MAGS-style simulation ---
-    #print("\nRunning discrete-time MAGS-style simulation with tuned PID...")
-    #simulate_discrete(
-      #  kp=best_kp,
-       # ki=best_ki,
-        #kd=best_kd,
-        #dt=0.05,
-       # sim_time=10.0,
-       # az_cmd=50.0,
-       # el_cmd=15.0,
-       # plot=True,
-       # return_logs=False,
-  #  )
 
-    # --- C) Example of time-varying command schedule (uncomment to try) ---
- 
-    cmd_schedule = [
-        (0.0,  50.0,  15.0),   # from t = 0s, command (50, 15)
-        (5.0, -20.0,  10.0),   # from t = 5s, command (-20, 10)
-        (8.0,  60.0,   0.0),   # from t = 8s, command (60, 0)
-    ]
+print("Tuning PID on continuous first-order servo model...")
 
-    simulate_discrete(
-        kp=best_kp,
-        ki=best_ki,
-        kd=best_kd,
-        dt=0.05,
-        sim_time=12.0,
-        az_cmd=0.0,
-        el_cmd=0.0,
-        cmd_schedule=cmd_schedule,
-        plot=True,
-        return_logs=False,
-    )
+best_kp, best_ki, best_kd = tune_pid() # likely when considering timing, we won't actually have enough computational time to the tune_pid everytime
+
+
+cmd_schedule = [ (5.0,  1), (7, 2 ),  (8,  3),(9,  3.1), (11, 3.2 ),  (14,  3.3),(15,  3.4), (15.5, 6 ),  (15.6,  6.2),(15.7,  6.3), (16, 6.4),  (16.2,  6.5)]
+
+simulate(
+    kp=best_kp,
+    ki=best_ki,
+    kd=best_kd,
+    dt=0.05,
+    sim_time=10.0,
+    cmd_schedule=cmd_schedule,
+    cmd_fs=1,
+    plot=True,
+    return_logs=False,
+)
 
