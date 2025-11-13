@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import control as ct
 
@@ -117,21 +118,27 @@ class FirstOrderServo:
             raw_rate = np.clip(raw_rate, -self.rate_limit, self.rate_limit)
         self.angle += raw_rate * dt
         return self.angle
-
-
-def read_command(i, cmd_schedule):
-    az_i, el_i = cmd_schedule[i][0], cmd_schedule[i][1] 
-    return az_i, el_i
-
+    
+def get_command(t_now, time_cmd, cmd_values):
+    """
+    Interpolate command value at current time t_now.
+    """
+    return np.interp(t_now, time_cmd, cmd_values)
 
 def simulate(kp=0.8, ki=0.02, kd=0.05,
-                      dt=0.05, sim_time=10.0,
-                      cmd_schedule = (0,0),
-                      cmd_fs=1,
-                      angle_limits=(-90, 90),
-                      dcmd_limit_per_step=5.0,
-                      plot=True,
-                      return_logs=False):
+             dt=0.05, sim_time=10.0,
+             cmd_file='sample_commands.csv',
+             angle_limits=(-90, 90),
+             dcmd_limit_per_step=5.0,
+             plot=True,
+             return_logs=False):
+
+    
+    #Read from CSV knowing that it must have columns: time, az_deg, el_deg
+    cmd_df = pd.read_csv(cmd_file)
+    time_cmd = cmd_df['time'].values
+    az_cmd   = cmd_df['az_deg'].values
+    el_cmd   = cmd_df['el_deg'].values
 
     # Initialize servos
     servo_pan = FirstOrderServo(init_angle=0.0, tau=tau)
@@ -145,11 +152,8 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
     time_log = []
     az_log, el_log = [], []
     az_err_log, el_err_log = [], []
-    sp_az_log, sp_el_log = [], []  
+    sp_az_log, sp_el_log = [], []
 
-    # command period and cmd schedule initialization
-    cmd_prd = 1/cmd_fs
-    i=0
     # Commanded states (servo setpoints)
     az_cmd_state = servo_pan.angle
     el_cmd_state = servo_tilt.angle
@@ -159,11 +163,9 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
         curr_az = servo_pan.angle
         curr_el = servo_tilt.angle
 
-        # Get setpoints 
-        if t!=0 and t % cmd_prd==0 and len(cmd_schedule) > i+1: # if our curr time is a multiple of our sampling period, then we update our command and read next item in the list of 
-            i=i+1
-
-        sp_az, sp_el = read_command(i, cmd_schedule)
+        # Interpolate commanded az/el from file at current time
+        sp_az = get_command(t, time_cmd, az_cmd)
+        sp_el = get_command(t, time_cmd, el_cmd)
 
         # PID control
         az_control, az_err, integral_az = pid_controller(
@@ -173,31 +175,29 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
             sp_el, curr_el, kp, ki, kd, prev_err_el, integral_el, dt
         )
 
-        # Update error memory
+        # Update error mem
         prev_err_az, prev_err_el = az_err, el_err
 
         # Limit increments in commanded angle
         az_delta = np.clip(az_control, -dcmd_limit_per_step, dcmd_limit_per_step)
         el_delta = np.clip(el_control, -dcmd_limit_per_step, dcmd_limit_per_step)
 
-        # Update commanded angles 
-        az_cmd_state = np.clip(az_cmd_state + az_delta,
-                               angle_limits[0], angle_limits[1])
-        el_cmd_state = np.clip(el_cmd_state + el_delta,
-                               angle_limits[0], angle_limits[1])
+        # Update commanded angles
+        az_cmd_state = np.clip(az_cmd_state + az_delta, angle_limits[0], angle_limits[1])
+        el_cmd_state = np.clip(el_cmd_state + el_delta, angle_limits[0], angle_limits[1])
 
-        # Servo physical step
+        # Servo step
         new_az = servo_pan.step(az_cmd_state, dt)
         new_el = servo_tilt.step(el_cmd_state, dt)
 
-        # Log
+        # Log (for graph)
         time_log.append(t)
         az_log.append(new_az)
         el_log.append(new_el)
         az_err_log.append(az_err)
         el_err_log.append(el_err)
-        sp_az_log.append(sp_az)   
-        sp_el_log.append(sp_el)   #
+        sp_az_log.append(sp_az)
+        sp_el_log.append(sp_el)
 
     # Convert to arrays
     time_log = np.asarray(time_log)
@@ -260,7 +260,6 @@ print("Tuning PID on continuous first-order servo model...")
 best_kp, best_ki, best_kd = tune_pid() # likely when considering timing, we won't actually have enough computational time to the tune_pid everytime
 
 
-cmd_schedule = [ (5.0,  1), (7, 2 ),  (8,  3),(9,  3.1), (11, 3.2 ),  (14,  3.3),(15,  3.4), (15.5, 6 ),  (15.6,  6.2),(15.7,  6.3), (16, 6.4),  (16.2,  6.5)]
 
 simulate(
     kp=best_kp,
@@ -268,9 +267,9 @@ simulate(
     kd=best_kd,
     dt=0.05,
     sim_time=10.0,
-    cmd_schedule=cmd_schedule,
-    cmd_fs=1,
+    cmd_file='sample_commands.csv',
     plot=True,
     return_logs=False,
 )
+
 
