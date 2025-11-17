@@ -3,11 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import control as ct
 
-
-# ----- Servo model (first-order) -----
+# Functions from python control package
 tau = 0.15  # this tau can be tuned 
 G_servo = ct.tf([1], [tau, 1])  # 1 / (tau s + 1)
-
 
 def make_pid_tf(kp, ki, kd):
     """
@@ -17,16 +15,15 @@ def make_pid_tf(kp, ki, kd):
     den = [1, 0]   
     return ct.tf(num, den)
 
-
 def make_closed_loop(kp, ki, kd):
     """
     Closed-loop tf is  T(s) = feedback(C(s)*G(s), 1)
     """
+    
     C = make_pid_tf(kp, ki, kd)
     L = C * G_servo          # open-loop
     T = ct.feedback(L, 1)    # unity feedback
     return T
-
 
 def settling_time_from_response(t, y, tol=0.02):
     y_err = np.abs(y - 1.0)
@@ -34,7 +31,6 @@ def settling_time_from_response(t, y, tol=0.02):
         if np.all(y_err[i:] < tol):
             return t[i]
     return t[-1]
-
 
 def tune_pid():
     """
@@ -69,7 +65,6 @@ def tune_pid():
 
     print("\nBest PID:", best_pid)
     return best_pid
-
 
 def plot_continuous_step_response(kp, ki, kd):
     """
@@ -121,9 +116,91 @@ class FirstOrderServo:
     
 def get_command(t_now, time_cmd, cmd_values):
     """
-    Interpolate command value at current time t_now.
+    Interpolate command value to minimize jagged responsiveness
     """
     return np.interp(t_now, time_cmd, cmd_values)
+
+def kalman_1d_angle(time, meas, q=0.01, r=1.0):
+    """
+    1D Kalman filter once again to help minimize jagged responsiveness
+    q and r are hyperparameters that we can continue to tune
+    """
+    time = np.asarray(time)
+    meas = np.asarray(meas)
+    n = len(time)
+
+    # state history angle, rate
+    x_hist = np.zeros((n, 2))
+
+    # initial state
+    x = np.array([meas[0], 0.0])
+
+    # initial covariance
+    P = np.eye(2) * 1.0
+
+    # measurement matrix and noise
+    H = np.array([[1.0, 0.0]]) 
+    R = np.array([[r]])
+
+    x_hist[0] = x
+
+    for k in range(1, n):
+        dt = time[k] - time[k - 1]
+        if dt <= 0:
+            dt = 1e-3  
+
+        # State transition matrix 
+        F = np.array([[1.0, dt],
+                      [0.0, 1.0]])
+
+        # Process noise 
+        Q = q * np.array([[dt**4 / 4.0, dt**3 / 2.0],
+                          [dt**3 / 2.0, dt**2]])
+
+        # --- Prediction ---
+        x_pred = F @ x
+        P_pred = F @ P @ F.T + Q
+
+        # --- Update ---
+        z = np.array([[meas[k]]])  # measurement at this step
+        y = z - H @ x_pred         # innovation
+        S = H @ P_pred @ H.T + R   # innovation covariance
+        K = P_pred @ H.T @ np.linalg.inv(S)  # Kalman gain
+
+        x = x_pred + (K @ y).flatten()
+        P = (np.eye(2) - K @ H) @ P_pred
+
+        x_hist[k] = x
+
+    angles = x_hist[:, 0]
+    rates = x_hist[:, 1]
+    return angles, rates
+
+def apply_kalman_to_commands(in_file='sample_commands.csv',
+                             out_file='sample_commands_filtered.csv',
+                             q=0.01,
+                             r=1.0):
+    # Load original commands
+    df = pd.read_csv(in_file)
+
+    t = df['time'].values
+    az = df['az_deg'].values
+    el = df['el_deg'].values
+
+    # Run Kalman filter independently on az and el
+    az_filt, az_rate = kalman_1d_angle(t, az, q=q, r=r)
+    el_filt, el_rate = kalman_1d_angle(t, el, q=q, r=r)
+
+    # Store back into dataframe
+    df['az_deg_filt'] = az_filt
+    df['el_deg_filt'] = el_filt
+    df['az_rate_filt'] = az_rate
+    df['el_rate_filt'] = el_rate
+
+    # Save to new CSV
+    df.to_csv(out_file, index=False)
+    print(f"Filtered commands written to {out_file}")
+
 
 def simulate(kp=0.8, ki=0.02, kd=0.05,
              dt=0.05, sim_time=10.0,
@@ -134,11 +211,12 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
              return_logs=False):
 
     
-    #Read from CSV knowing that it must have columns: time, az_deg, el_deg
+
     cmd_df = pd.read_csv(cmd_file)
     time_cmd = cmd_df['time'].values
-    az_cmd   = cmd_df['az_deg'].values
-    el_cmd   = cmd_df['el_deg'].values
+    az_cmd   = cmd_df['az_deg_filt'].values
+    el_cmd   = cmd_df['el_deg_filt'].values
+
 
     # Initialize servos
     servo_pan = FirstOrderServo(init_angle=0.0, tau=tau)
@@ -252,24 +330,26 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
     return None
 
 
-
-
-
 print("Tuning PID on continuous first-order servo model...")
 
 best_kp, best_ki, best_kd = tune_pid() # likely when considering timing, we won't actually have enough computational time to the tune_pid everytime
 
 
+apply_kalman_to_commands(
+    in_file='sample_commands.csv',
+    out_file='sample_commands_filtered.csv',
+    q=0.01,
+    r=1.0,
+)
 
+# 2) Run simulation using the filtered commands
 simulate(
     kp=best_kp,
     ki=best_ki,
     kd=best_kd,
     dt=0.05,
     sim_time=10.0,
-    cmd_file='sample_commands.csv',
+    cmd_file='sample_commands_filtered.csv',
     plot=True,
     return_logs=False,
 )
-
-
