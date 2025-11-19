@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import control as ct
+import csv
 
 # Functions from python control package
 tau = 0.15  # this tau can be tuned 
@@ -202,6 +203,65 @@ def apply_kalman_to_commands(in_file='sample_commands.csv',
     print(f"Filtered commands written to {out_file}")
 
 
+def generate_samples_commands(fs, samples):
+    """
+    Kinematics:
+      Horizontal:
+        x(t) = 160 - t
+        y(t) = t
+
+      Vertical (z):
+        z(t) = -2.8 t (t - 155)          for 0 < t < 20
+        z'(t) = -54 t + 8640             for 20 <= t < 160
+    """
+
+    # Time vector
+    t = np.arange(samples, dtype=float) / float(fs)
+
+    # z(t) (piecewise)
+    def z_of_t(t_arr):
+        t_arr = np.asarray(t_arr, dtype=float)
+        z = np.zeros_like(t_arr)
+
+        # Region 0 < t < 20
+        mask1 = (t_arr > 0) & (t_arr < 20)
+        z[mask1] = -2.8 * t_arr[mask1] * (t_arr[mask1] - 155.0)
+
+        # Region 20 <= t < 160
+      
+        mask2 = (t_arr >= 20)
+        z[mask2] = -54.0 * t_arr[mask2] + 8640.0
+
+        return z
+
+    # Horizontal 
+    x = 160.0 - t
+    y = t
+    z = z_of_t(t)
+
+    # Convert to spherical angles  
+  
+    az_rad = np.arctan2(y, x)
+    az_deg = np.degrees(az_rad)
+    az_deg = (az_deg + 360.0) % 360.0
+
+
+    r_xy = np.sqrt(x**2 + y**2)
+    el_rad = np.arctan2(z, r_xy)
+    el_deg = np.degrees(el_rad)
+
+    data = np.column_stack([t, az_deg, el_deg])
+
+    # --- Write CSV ---
+    filename = "sample_commands.csv"
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "az_deg", "el_deg"])
+        writer.writerows(data)
+
+    print(f"Wrote {samples} samples to {filename}")
+
+
 def simulate(kp=0.8, ki=0.02, kd=0.05,
              dt=0.05, sim_time=10.0,
              cmd_file='sample_commands.csv',
@@ -314,7 +374,10 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
         plt.grid(True)
 
         plt.tight_layout()
-        plt.show()
+        plt.savefig("mags_sim_plot.png")
+        print("Saved plot to mags_sim_plot.png")
+        # plt.show()  # comment this for now
+
 
     if return_logs:
         return {
@@ -330,26 +393,33 @@ def simulate(kp=0.8, ki=0.02, kd=0.05,
     return None
 
 
-print("Tuning PID on continuous first-order servo model...")
 
-best_kp, best_ki, best_kd = tune_pid() # likely when considering timing, we won't actually have enough computational time to the tune_pid everytime
+if __name__ == "__main__":
+    fs = 10.0       # 10 Hz sampling
+    samples = 500   # 500 time steps
+    generate_samples_commands(fs, samples)
+
+    print("Tuning PID on continuous first-order servo model")
+    best_kp, best_ki, best_kd = tune_pid()
+
+    apply_kalman_to_commands(
+        in_file='sample_commands.csv',
+        out_file='sample_commands_filtered.csv',
+        q=0.01,
+        r=1.0,
+    )
+
+    print("Starting simulate...")
+    simulate(
+        kp=best_kp,
+        ki=best_ki,
+        kd=best_kd,
+        dt=0.05,
+        sim_time=10.0,
+        cmd_file='sample_commands_filtered.csv',
+        plot=True,
+        return_logs=False,
+    )
+    print("Done.")
 
 
-apply_kalman_to_commands(
-    in_file='sample_commands.csv',
-    out_file='sample_commands_filtered.csv',
-    q=0.01,
-    r=1.0,
-)
-
-# 2) Run simulation using the filtered commands
-simulate(
-    kp=best_kp,
-    ki=best_ki,
-    kd=best_kd,
-    dt=0.05,
-    sim_time=10.0,
-    cmd_file='sample_commands_filtered.csv',
-    plot=True,
-    return_logs=False,
-)
