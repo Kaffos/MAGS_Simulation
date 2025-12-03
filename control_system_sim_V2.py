@@ -4,21 +4,17 @@ import matplotlib.pyplot as plt
 import control as ct
 import csv
 
-# Functions from python control package
-tau = 0.45
-G_servo = ct.tf([1], [tau, 1])  # first order: 1 / (tau s + 1)
-# G_servo = ct.tf([1], [tau, 1, 0])  # 1 / (tau s^2 + s)
-
-
 # ============================================================
-# Servo datasheet based constants and conversions
+# GLOBAL SERVO CONSTANTS
 # ============================================================
 
-SERVO_GEAR_RATIO = 7.0           # 7:1 from datasheet (not used directly here)
+tau_default = 0.45
+G_servo = ct.tf([1], [tau_default, 1])  # first-order continuous model
+
+SERVO_GEAR_RATIO = 7.0           # 7:1 from datasheet
 SERVO_VOLTAGE_MIN = 6.0
 SERVO_VOLTAGE_MAX = 7.4
 
-# No load speeds from datasheet, converted to deg/s
 SERVO_SPEED_6V_DEG_PER_S = 60.0 / 1.19   # 1.19 s per 60 deg
 SERVO_SPEED_7_4V_DEG_PER_S = 60.0 / 0.98 # 0.98 s per 60 deg
 
@@ -35,9 +31,13 @@ ANGLE_CENTER_DEG = 180.0
 PWM_DEADBAND_US = 1.0   # deadband width from datasheet
 
 
+# ============================================================
+# HELPER FUNCTIONS: SERVO CHARACTERISTICS
+# ============================================================
+
 def servo_speed_from_voltage(voltage):
     """
-    Interpolate no load speed between 6 V and 7.4 V based on datasheet.
+    Interpolate no-load speed between 6 V and 7.4 V based on datasheet.
     Returns max speed in deg/s.
     """
     v = float(voltage)
@@ -65,34 +65,43 @@ def pwm_to_angle_deg(pulse_us):
 def angle_deg_to_pwm(angle_deg):
     """
     Inverse mapping of pwm_to_angle_deg:
-      0-360 deg -> 800-2200 us (approximately)
+      0-360 deg -> 800-2200 us (approximately).
     """
     angle_deg = np.clip(angle_deg, ANGLE_MIN_DEG, ANGLE_MAX_DEG)
     pulse = PWM_CENTER_US + (angle_deg - ANGLE_CENTER_DEG) / TRAVEL_DEG_PER_US
     return float(np.clip(pulse, PWM_MIN_US, PWM_MAX_US))
 
 
+# ============================================================
+# PID TRANSFER FUNCTION + CONTINUOUS TUNING
+# ============================================================
+
 def make_pid_tf(kp, ki, kd):
     """
-    PID controller tf is C(s) = (Kd*s^2 + Kp*s + Ki) / s
+    Continuous-time PID controller: C(s) = (Kd*s^2 + Kp*s + Ki) / s
     """
     num = [kd, kp, ki]
     den = [1, 0]
     return ct.tf(num, den)
 
 
-def make_closed_loop(kp, ki, kd):
+def make_closed_loop(kp, ki, kd, G=None):
     """
-    Closed-loop tf is T(s) = feedback(C(s)*G(s), 1)
+    Closed-loop continuous transfer function with unity feedback.
     """
+    if G is None:
+        G = G_servo
     C = make_pid_tf(kp, ki, kd)
-    L = C * G_servo          # open-loop
-    T = ct.feedback(L, 1)    # unity feedback
+    L = C * G
+    T = ct.feedback(L, 1)
     return T
 
 
-def settling_time_from_response(t, y, tol=0.02):
-    y_err = np.abs(y - 1.0)
+def settling_time_from_response(t, y, tol=0.02, target=1.0):
+    """
+    Settling time: earliest time after which |y - target| < tol for all remaining samples.
+    """
+    y_err = np.abs(y - target)
     for i in range(len(t)):
         if np.all(y_err[i:] < tol):
             return t[i]
@@ -114,103 +123,69 @@ def pid_step_cost(
     where:
       IAE  = integral of absolute error
       Ts   = settling time
-      Mp   = overshoot (absolute, not percent)
-      e_ss = steady state error (last sample)
+      Mp   = overshoot (absolute)
+      e_ss = steady state error
     """
     t = np.asarray(t)
     y = np.asarray(y)
-
     if len(t) < 2:
         return np.inf
 
     dt = t[1] - t[0]
-
-    # error for unit step
     e = target - y
 
-    # integral of absolute error
     iae = np.sum(np.abs(e)) * dt
-
-    # settling time
-    Ts = settling_time_from_response(t, y, tol=tol)
-
-    # overshoot
+    Ts = settling_time_from_response(t, y, tol=tol, target=target)
     Mp = max(0.0, np.max(y) - target)
-
-    # steady state error (last sample)
     e_ss = abs(e[-1])
 
-    # total cost
     J = iae + beta * Ts + gamma * Mp + delta * e_ss
     return J
 
 
-def tune_pid():
+def tune_pid_step(G=None):
     """
-    Simple grid search over PID gains using python-control on the first-order servo model.
-    Minimizes a cost combining settling time, overshoot, and steady state error.
+    Grid-search PID gains on continuous-time first-order model using step cost.
+    Returns best (kp, ki, kd).
     """
+    if G is None:
+        G = G_servo
+
     kp_vals = np.linspace(0.5, 8.0, 12)
     ki_vals = np.linspace(0.0, 5.0, 11)
     kd_vals = np.linspace(0.0, 1.0, 6)
 
-    best_cost = 1e9
+    best_cost = np.inf
     best_pid = None
 
-    t = np.linspace(0, 5, 500)  # 5 s step response
+    t = np.linspace(0, 5, 500)  # 5 s step
 
     for kp in kp_vals:
         for ki in ki_vals:
             for kd in kd_vals:
                 try:
-                    T_cl = make_closed_loop(kp, ki, kd)
+                    T_cl = make_closed_loop(kp, ki, kd, G=G)
                     t_out, y_out = ct.step_response(T_cl, T=t)
                 except Exception:
                     continue
 
-                cost = pid_step_cost(
-                    t_out,
-                    y_out,
-                    beta=0.2,
-                    gamma=3.0,
-                    delta=10.0,
-                    target=1.0,
-                    tol=0.02,
-                )
+                cost = pid_step_cost(t_out, y_out)
 
                 if cost < best_cost:
                     best_cost = cost
                     best_pid = (kp, ki, kd)
                     print(
-                        f"New best (continuous model): "
-                        f"cost={best_cost:.3f}, kp={kp:.3f}, "
-                        f"ki={ki:.3f}, kd={kd:.3f}"
+                        f"New best (step tuning): "
+                        f"cost={best_cost:.3f}, kp={kp:.3f}, ki={ki:.3f}, kd={kd:.3f}"
                     )
 
-    print("\nBest PID:", best_pid)
+    print("\nBest PID from step tuning:", best_pid)
     return best_pid
 
 
-def plot_continuous_step_response(kp, ki, kd):
-    """
-    Plot step response of the continuous-time closed-loop model
-    for the chosen PID gains.
-    """
-    T_cl = make_closed_loop(kp, ki, kd)
-    t = np.linspace(0, 5, 500)
-    t_out, y_out = ct.step_response(T_cl, T=t)
-
-    plt.figure()
-    plt.plot(t_out, y_out, label='Closed-loop response')
-    plt.axhline(1.0, linestyle='--', label='Step (1.0)')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Output (normalized angle)')
-    plt.title(f'Continuous-time step response (kp={kp:.2f}, ki={ki:.2f}, kd={kd:.2f})')
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
+# ============================================================
+# DISCRETE PID + SERVO MODEL
+# ============================================================
 
 def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
     """
@@ -225,15 +200,14 @@ def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
 
 class FirstOrderServo:
     """
-    First order position servo with PWM input, voltage dependent speed,
+    First-order position servo with PWM input, voltage-dependent speed,
     and 0-360 deg travel.
 
-    Internally:
-      angle[k+1] = angle[k] + rate * dt
-      rate ~ (cmd_angle - angle) / tau, limited to +/- rate_limit
+    angle[k+1] = angle[k] + rate * dt
+    rate ~ (cmd_angle - angle) / tau, limited to +/- rate_limit
     """
+
     def __init__(self, init_angle=180.0, tau=0.45, voltage=7.4):
-        # clamp initial angle to valid range
         self.angle = float(np.clip(init_angle, ANGLE_MIN_DEG, ANGLE_MAX_DEG))
         self.tau = float(tau)
         self.voltage = float(voltage)
@@ -241,24 +215,11 @@ class FirstOrderServo:
         self.last_pwm = PWM_CENTER_US
 
     def set_voltage(self, voltage):
-        """
-        Change supply voltage at runtime and update speed limit.
-        """
         self.voltage = float(voltage)
         self.rate_limit = servo_speed_from_voltage(self.voltage)
 
-    def step_angle(self, cmd_angle_deg, dt):
-        """
-        Direct angle domain step (bypasses PWM mapping).
-        Still respects voltage based rate limit and 0-360 deg clamp.
-        """
-        cmd = float(np.clip(cmd_angle_deg, ANGLE_MIN_DEG, ANGLE_MAX_DEG))
-        raw_rate = (cmd - self.angle) / max(self.tau, 1e-6)
-        raw_rate = np.clip(raw_rate, -self.rate_limit, self.rate_limit)
-        self.angle = float(
-            np.clip(self.angle + raw_rate * dt, ANGLE_MIN_DEG, ANGLE_MAX_DEG)
-        )
-        return self.angle
+    def set_tau(self, tau):
+        self.tau = float(tau)
 
     def step_pwm(self, pulse_us, dt):
         """
@@ -266,7 +227,6 @@ class FirstOrderServo:
         """
         raw_pwm = float(pulse_us)
 
-        # Apply deadband in PWM domain: changes smaller than 1 us produce no motion
         if abs(raw_pwm - self.last_pwm) <= PWM_DEADBAND_US:
             effective_pwm = self.last_pwm
         else:
@@ -274,10 +234,8 @@ class FirstOrderServo:
 
         self.last_pwm = raw_pwm
 
-        # Convert PWM to commanded angle
         cmd_angle = pwm_to_angle_deg(effective_pwm)
 
-        # First order dynamics with rate limit based on supply voltage
         raw_rate = (cmd_angle - self.angle) / max(self.tau, 1e-6)
         raw_rate = np.clip(raw_rate, -self.rate_limit, self.rate_limit)
 
@@ -287,33 +245,24 @@ class FirstOrderServo:
         return self.angle
 
 
-def get_command(t_now, time_cmd, cmd_values):
-    """
-    Interpolate command value to minimize jagged responsiveness
-    """
-    return np.interp(t_now, time_cmd, cmd_values)
-
+# ============================================================
+# KALMAN FILTER FOR COMMAND SMOOTHING
+# ============================================================
 
 def kalman_1d_angle(time, meas, q=0.01, r=1.0):
     """
-    1D Kalman filter to help minimize jagged responsiveness.
-    q and r are hyperparameters that we can continue to tune.
+    1D constant-velocity Kalman filter for smoother angle commands.
+    State: [angle, rate].
     """
     time = np.asarray(time)
     meas = np.asarray(meas)
     n = len(time)
 
-    # state history angle, rate
     x_hist = np.zeros((n, 2))
-
-    # initial state
     x = np.array([meas[0], 0.0])
-
-    # initial covariance
     P = np.eye(2) * 1.0
 
-    # measurement matrix and noise
-    H = np.array([[1.0, 0.0]])
+    H = np.array([[1.0, 0.0]])   # measure angle only
     R = np.array([[r]])
 
     x_hist[0] = x
@@ -323,23 +272,21 @@ def kalman_1d_angle(time, meas, q=0.01, r=1.0):
         if dt <= 0:
             dt = 1e-3
 
-        # State transition matrix
         F = np.array([[1.0, dt],
                       [0.0, 1.0]])
 
-        # Process noise
         Q = q * np.array([[dt**4 / 4.0, dt**3 / 2.0],
                           [dt**3 / 2.0, dt**2]])
 
-        # Prediction
+        # Predict
         x_pred = F @ x
         P_pred = F @ P @ F.T + Q
 
         # Update
-        z = np.array([[meas[k]]])  # measurement at this step
-        y = z - H @ x_pred         # innovation
-        S = H @ P_pred @ H.T + R   # innovation covariance
-        K = P_pred @ H.T @ np.linalg.inv(S)  # Kalman gain
+        z = np.array([[meas[k]]])
+        y = z - H @ x_pred
+        S = H @ P_pred @ H.T + R
+        K = P_pred @ H.T @ np.linalg.inv(S)
 
         x = x_pred + (K @ y).flatten()
         P = (np.eye(2) - K @ H) @ P_pred
@@ -351,68 +298,40 @@ def kalman_1d_angle(time, meas, q=0.01, r=1.0):
     return angles, rates
 
 
-def apply_kalman_to_commands(in_file='sample_commands.csv',
-                             out_file='sample_commands_filtered.csv',
-                             q=0.01,
-                             r=1.0):
-    # Load original commands
-    df = pd.read_csv(in_file)
+# ============================================================
+# COMMAND GENERATION + KALMAN APPLICATION
+# ============================================================
 
-    t = df['time'].values
-    az = df['az_deg'].values
-    el = df['el_deg'].values
-
-    # Run Kalman filter independently on az and el
-    az_filt, az_rate = kalman_1d_angle(t, az, q=q, r=r)
-    el_filt, el_rate = kalman_1d_angle(t, el, q=q, r=r)
-
-    # Store back into dataframe
-    df['az_deg_filt'] = az_filt
-    df['el_deg_filt'] = el_filt
-    df['az_rate_filt'] = az_rate
-    df['el_rate_filt'] = el_rate
-
-    # Save to new CSV
-    df.to_csv(out_file, index=False)
-    print(f"Filtered commands written to {out_file}")
-
-
-def generate_samples_commands(fs, samples):
+def generate_samples_commands(fs, samples, filename="sample_commands.csv"):
     """
+    Generate synthetic rocket trajectory and write to CSV.
+
     Kinematics:
       Horizontal:
         x(t) = 160 - t
         y(t) = t
 
-      Vertical (z):
-        z(t) = -2.8 t (t - 155)          for 0 < t < 20
-        z'(t) = -54 t + 8640             for 20 <= t < 160
+      Vertical:
+      
     """
-
-    # Time vector
     t = np.arange(samples, dtype=float) / float(fs)
 
-    # z(t) (piecewise)
     def z_of_t(t_arr):
         t_arr = np.asarray(t_arr, dtype=float)
         z = np.zeros_like(t_arr)
 
-        # Region 0 < t < 20
         mask1 = (t_arr > 0) & (t_arr < 20)
         z[mask1] = -2.8 * t_arr[mask1] * (t_arr[mask1] - 155.0)
 
-        # Region 20 <= t < 160
         mask2 = (t_arr >= 20)
         z[mask2] = -54.0 * t_arr[mask2] + 8640.0
 
         return z
 
-    # Horizontal
     x = 160.0 - t
     y = t
     z = z_of_t(t)
 
-    # Convert to spherical angles
     az_rad = np.arctan2(y, x)
     az_deg = np.degrees(az_rad)
     az_deg = (az_deg + 360.0) % 360.0
@@ -423,66 +342,104 @@ def generate_samples_commands(fs, samples):
 
     data = np.column_stack([t, az_deg, el_deg])
 
-    # Write CSV
-    filename = "sample_commands.csv"
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["time", "az_deg", "el_deg"])
         writer.writerows(data)
 
-    print(f"Wrote {samples} samples to {filename}")
+    print(f"Wrote {samples} samples at fs={fs} Hz to {filename}")
+    return filename
+
+
+def apply_kalman_to_commands(in_file, out_file, q=0.01, r=1.0):
+    """
+    Load commands, apply Kalman filter on azimuth and elevation,
+    and write filtered outputs.
+    """
+    df = pd.read_csv(in_file)
+
+    t = df['time'].values
+    az = df['az_deg'].values
+    el = df['el_deg'].values
+
+    az_filt, az_rate = kalman_1d_angle(t, az, q=q, r=r)
+    el_filt, el_rate = kalman_1d_angle(t, el, q=q, r=r)
+
+    df['az_deg_filt'] = az_filt
+    df['el_deg_filt'] = el_filt
+    df['az_rate_filt'] = az_rate
+    df['el_rate_filt'] = el_rate
+
+    df.to_csv(out_file, index=False)
+    print(f"Filtered commands written to {out_file} (q={q}, r={r})")
+    return out_file
+
+
+def generate_and_filter_commands(fs, samples, q, r,
+                                 raw_file="sample_commands.csv",
+                                 filt_file="sample_commands_filtered.csv"):
+    """
+    Convenience wrapper: generate trajectory and filter it.
+    """
+    raw = generate_samples_commands(fs, samples, filename=raw_file)
+    filt = apply_kalman_to_commands(raw, filt_file, q=q, r=r)
+    return filt
+
+
+# ============================================================
+# SIMULATION + METRICS
+# ============================================================
+
+def get_command(t_now, time_cmd, cmd_values):
+    """
+    Interpolate command value at time t_now.
+    """
+    return np.interp(t_now, time_cmd, cmd_values)
 
 
 def simulate(
-    kp=0.8,
-    ki=0.02,
-    kd=0.05,
+    kp,
+    ki,
+    kd,
     dt=0.05,
     sim_time=10.0,
     cmd_file='sample_commands_filtered.csv',
-    angle_limits=(ANGLE_MIN_DEG, ANGLE_MAX_DEG),
-    dcmd_limit_per_step=5.0,  # currently unused but kept as parameter
-    plot=True,
-    return_logs=False,
+    tau=tau_default,
     servo_voltage=7.4,
+    plot=False,
+    return_logs=False,
 ):
-
+    """
+    Run full discrete-time simulation for pan/tilt servos following
+    filtered command trajectories from CSV.
+    """
     cmd_df = pd.read_csv(cmd_file)
     time_cmd = cmd_df['time'].values
     az_cmd = cmd_df['az_deg_filt'].values
     el_cmd = cmd_df['el_deg_filt'].values
 
-    # Start servos at first commanded angles
     init_az = float(az_cmd[0])
     init_el = float(el_cmd[0])
 
     servo_pan = FirstOrderServo(init_angle=init_az, tau=tau, voltage=servo_voltage)
     servo_tilt = FirstOrderServo(init_angle=init_el, tau=tau, voltage=servo_voltage)
 
-    # PID states
     prev_err_az, prev_err_el = 0.0, 0.0
     integral_az, integral_el = 0.0, 0.0
 
-    # Logs
     time_log = []
     az_log, el_log = [], []
     az_err_log, el_err_log = [], []
     sp_az_log, sp_el_log = [], []
-
-    # Commanded states (servo setpoints)
-    az_cmd_state = init_az
-    el_cmd_state = init_el
 
     t_vals = np.arange(0.0, sim_time, dt)
     for t in t_vals:
         curr_az = servo_pan.angle
         curr_el = servo_tilt.angle
 
-        # Interpolate commanded az/el from file at current time
         sp_az = get_command(t, time_cmd, az_cmd)
         sp_el = get_command(t, time_cmd, el_cmd)
 
-        # PID control
         az_control, az_err, integral_az = pid_controller(
             sp_az, curr_az, kp, ki, kd, prev_err_az, integral_az, dt
         )
@@ -490,21 +447,17 @@ def simulate(
             sp_el, curr_el, kp, ki, kd, prev_err_el, integral_el, dt
         )
 
-        # Update error memory
         prev_err_az, prev_err_el = az_err, el_err
 
-        # Treat PID output as an absolute angle command
-        az_cmd_state = np.clip(az_control, angle_limits[0], angle_limits[1])
-        el_cmd_state = np.clip(el_control, angle_limits[0], angle_limits[1])
+        az_cmd_state = np.clip(az_control, ANGLE_MIN_DEG, ANGLE_MAX_DEG)
+        el_cmd_state = np.clip(el_control, ANGLE_MIN_DEG, ANGLE_MAX_DEG)
 
-        # Convert angle command to PWM, then step servo using PWM
         pwm_az = angle_deg_to_pwm(az_cmd_state)
         pwm_el = angle_deg_to_pwm(el_cmd_state)
 
         new_az = servo_pan.step_pwm(pwm_az, dt)
         new_el = servo_tilt.step_pwm(pwm_el, dt)
 
-        # Log for graph
         time_log.append(t)
         az_log.append(new_az)
         el_log.append(new_el)
@@ -522,87 +475,56 @@ def simulate(
     sp_az_log = np.asarray(sp_az_log)
     sp_el_log = np.asarray(sp_el_log)
 
+    logs = {
+        "time": time_log,
+        "az": az_log,
+        "el": el_log,
+        "az_err": az_err_log,
+        "el_err": el_err_log,
+        "sp_az": sp_az_log,
+        "sp_el": sp_el_log,
+    }
+
     if plot:
         plt.figure(figsize=(10, 6))
 
-        # Angles vs time
         plt.subplot(2, 1, 1)
-        plt.plot(time_log, az_log, label='Current Azimuth (°)')
-        plt.plot(time_log, el_log, label='Current Elevation (°)')
-
-        # Plot commanded signals
-        plt.plot(time_log, sp_az_log, '--', label='Commanded Azimuth (°)')
-        plt.plot(time_log, sp_el_log, '--', label='Commanded Elevation (°)')
-
-        plt.title('Discrete Servo Angles vs Time (MAGS sim)')
-        plt.ylabel('Angle (°)')
+        plt.plot(time_log, az_log, label='Azimuth (current)')
+        plt.plot(time_log, el_log, label='Elevation (current)')
+        plt.plot(time_log, sp_az_log, '--', label='Azimuth (command)')
+        plt.plot(time_log, sp_el_log, '--', label='Elevation (command)')
+        plt.title('Servo Angles vs Time')
+        plt.ylabel('Angle (deg)')
         plt.legend()
         plt.grid(True)
 
-        # Errors vs time
         plt.subplot(2, 1, 2)
-        plt.plot(time_log, az_err_log, label='Azimuth Error (°)')
-        plt.plot(time_log, el_err_log, label='Elevation Error (°)')
-        plt.title('Discrete Tracking Error vs Time')
+        plt.plot(time_log, az_err_log, label='Azimuth Error')
+        plt.plot(time_log, el_err_log, label='Elevation Error')
+        plt.title('Tracking Error vs Time')
         plt.xlabel('Time (s)')
-        plt.ylabel('Error (°)')
+        plt.ylabel('Error (deg)')
         plt.legend()
         plt.grid(True)
 
         plt.tight_layout()
-        plt.savefig("mags_sim_plot_v2.png")
-        print("Saved plot to mags_sim_plot_v2.png")
+        plt.savefig("mags_sim_plot.png")
+        print("Saved plot to mags_sim_plot.png")
 
     if return_logs:
-        return {
-            "time": time_log,
-            "az": az_log,
-            "el": el_log,
-            "az_err": az_err_log,
-            "el_err": el_err_log,
-            "sp_az": sp_az_log,
-            "sp_el": sp_el_log,
-        }
-
+        return logs
     return None
 
 
-# ============================================================
-# STAGE 2: TRAJECTORY-BASED COST AND LOCAL TUNING (TEST ONLY NOT ACTUALLY USED)
-# ============================================================
-
-def trajectory_cost(kp, ki, kd,
-                    dt=0.05,
-                    sim_time=10.0,
-                    cmd_file='sample_commands_filtered.csv',
-                    big_err_deg=5.0):
+def compute_tracking_metrics(logs, big_err_deg=5.0):
     """
-    Cost based on actual trajectory tracking.
-
-    J_traj = IAE_traj + 10 * T_big_err
-
-    where:
-      IAE_traj   = integral of |e_az| + |e_el|
-      T_big_err  = time with max(|e_az|,|e_el|) > big_err_deg
+    Compute tracking metrics:
+      - max az error
+      - max el error
+      - IAE total (az + el)
+      - time with |err| > big_err_deg
     """
-    logs = simulate(
-        kp=kp,
-        ki=ki,
-        kd=kd,
-        dt=dt,
-        sim_time=sim_time,
-        cmd_file=cmd_file,
-        plot=False,
-        return_logs=True,
-    )
-
-    if logs is None:
-        return np.inf
-
     t = logs["time"]
-    if len(t) < 2:
-        return np.inf
-
     az = logs["az"]
     el = logs["el"]
     sp_az = logs["sp_az"]
@@ -610,65 +532,7 @@ def trajectory_cost(kp, ki, kd,
 
     e_az = sp_az - az
     e_el = sp_el - el
-
-    dt = t[1] - t[0]
-
-    iae_traj = np.sum(np.abs(e_az) + np.abs(e_el)) * dt
-
-    max_err = np.maximum(np.abs(e_az), np.abs(e_el))
-    big_mask = max_err > big_err_deg
-    big_time = np.sum(big_mask) * dt
-
-    cost = iae_traj + 10.0 * big_time
-    return cost
-
-
-def tune_pid_trajectory(base_kp, base_ki, base_kd):
-    """
-    Stage 2:
-    Local search around the step-tuned PID using trajectory cost.
-    """
-
-    # build local ranges around the base gains
-    kp_vals = np.linspace(0.7 * base_kp, 1.3 * base_kp, 7)
-    ki_vals = np.linspace(0.7 * base_ki, 1.3 * base_ki, 7)
-    kd_vals = np.linspace(0.0, 0.5 * max(0.1, base_kp), 5)  # small Kd range
-
-    best_cost = np.inf
-    best_pid = (base_kp, base_ki, base_kd)
-
-    for kp in kp_vals:
-        for ki in ki_vals:
-            for kd in kd_vals:
-                cost = trajectory_cost(
-                    kp, ki, kd,
-                    dt=0.05,
-                    sim_time=10.0,
-                    cmd_file='sample_commands_filtered.csv',
-                    big_err_deg=5.0,
-                )
-
-                if not np.isfinite(cost):
-                    continue
-
-                if cost < best_cost:
-                    best_cost = cost
-                    best_pid = (kp, ki, kd)
-                    print(
-                        f"New best (traj cost): "
-                        f"cost={best_cost:.3f}, kp={kp:.3f}, "
-                        f"ki={ki:.3f}, kd={kd:.3f}"
-                    )
-
-    print("\nBest PID from trajectory tuning:", best_pid)
-    return best_pid
-
-def summarize_tracking(logs, big_err_deg=5.0):
-    t = logs["time"]
-    e_az = logs["sp_az"] - logs["az"]
-    e_el = logs["sp_el"] - logs["el"]
-
-    dt = t[1] - t[0]
+    dt = t[1] - t[0] if len(t) > 1 else 0.0
 
     max_err_az = np.max(np.abs(e_az))
     max_err_el = np.max(np.abs(e_el))
@@ -678,47 +542,413 @@ def summarize_tracking(logs, big_err_deg=5.0):
     max_err = np.maximum(np.abs(e_az), np.abs(e_el))
     big_time = np.sum(max_err > big_err_deg) * dt
 
-    print(f"Max az error  : {max_err_az:.2f} deg")
-    print(f"Max el error  : {max_err_el:.2f} deg")
-    print(f"IAE (total)   : {iae:.2f} deg·s")
-    print(f"Time |err|>{big_err_deg}°: {big_time:.2f} s")
+    return {
+        "max_err_az": max_err_az,
+        "max_err_el": max_err_el,
+        "IAE_total": iae,
+        "time_big_err": big_time,
+    }
+
+
+def print_metrics(label, metrics):
+    print(f"\n[{label}]")
+    print(f"  Max az error    : {metrics['max_err_az']:.2f} deg")
+    print(f"  Max el error    : {metrics['max_err_el']:.2f} deg")
+    print(f"  IAE (total)     : {metrics['IAE_total']:.2f} deg·s")
+    print(f"  Time |err|>5°   : {metrics['time_big_err']:.2f} s")
+
 
 # ============================================================
-# MAIN
+# EXPERIMENTS
+# ============================================================
+
+def experiment_dt_sweep(kp, ki, kd,
+                        dt_list,
+                        sim_time,
+                        cmd_file,
+                        tau=tau_default,
+                        servo_voltage=7.4):
+    """
+    Sweep control-loop dt and plot tracking metrics vs dt.
+    """
+    results = []
+
+    for dt in dt_list:
+        logs = simulate(
+            kp, ki, kd,
+            dt=dt,
+            sim_time=sim_time,
+            cmd_file=cmd_file,
+            tau=tau,
+            servo_voltage=servo_voltage,
+            plot=False,
+            return_logs=True,
+        )
+        metrics = compute_tracking_metrics(logs)
+        print_metrics(f"dt={dt:.3f}s", metrics)
+
+        row = {"dt": dt}
+        row.update(metrics)
+        results.append(row)
+
+    df = pd.DataFrame(results)
+
+    # IAE vs dt
+    plt.figure()
+    plt.plot(df["dt"], df["IAE_total"], marker='o')
+    plt.xlabel("Control-loop dt (s)")
+    plt.ylabel("IAE_total (deg·s)")
+    plt.title("IAE vs Control-loop dt")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("exp_dt_IAE.png")
+    print("Saved IAE vs dt plot to exp_dt_IAE.png")
+
+    # Time |err|>5° vs dt
+    plt.figure()
+    plt.plot(df["dt"], df["time_big_err"], marker='o')
+    plt.xlabel("Control-loop dt (s)")
+    plt.ylabel("Time |err|>5° (s)")
+    plt.title("Big-error time vs dt")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("exp_dt_bigerr.png")
+    print("Saved big-error vs dt plot to exp_dt_bigerr.png")
+
+    return df
+
+
+def experiment_servo_voltage_sweep(kp, ki, kd,
+                                   voltage_list,
+                                   dt,
+                                   sim_time,
+                                   cmd_file,
+                                   tau=tau_default):
+    """
+    Sweep servo supply voltage and see impact on tracking.
+    """
+    results = []
+
+    for V in voltage_list:
+        logs = simulate(
+            kp, ki, kd,
+            dt=dt,
+            sim_time=sim_time,
+            cmd_file=cmd_file,
+            tau=tau,
+            servo_voltage=V,
+            plot=False,
+            return_logs=True,
+        )
+        metrics = compute_tracking_metrics(logs)
+        print_metrics(f"servo_voltage={V:.2f}V", metrics)
+
+        row = {"servo_voltage": V}
+        row.update(metrics)
+        results.append(row)
+
+    df = pd.DataFrame(results)
+
+    plt.figure()
+    plt.plot(df["servo_voltage"], df["IAE_total"], marker='o')
+    plt.xlabel("Servo voltage (V)")
+    plt.ylabel("IAE_total (deg·s)")
+    plt.title("IAE vs Servo Voltage")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("exp_voltage_IAE.png")
+    print("Saved IAE vs voltage plot to exp_voltage_IAE.png")
+
+    return df
+
+
+def experiment_fs_sweep(kp, ki, kd,
+                        fs_list,
+                        samples,
+                        q,
+                        r,
+                        dt,
+                        sim_time,
+                        raw_file="sample_commands.csv",
+                        filt_file="sample_commands_filtered.csv",
+                        tau=tau_default,
+                        servo_voltage=7.4):
+    """
+    Sweep the command sampling rate fs and see effect on tracking.
+    """
+    results = []
+
+    for fs in fs_list:
+        filt_cmd_file = generate_and_filter_commands(
+            fs, samples, q=q, r=r,
+            raw_file=raw_file,
+            filt_file=filt_file
+        )
+
+        logs = simulate(
+            kp, ki, kd,
+            dt=dt,
+            sim_time=sim_time,
+            cmd_file=filt_cmd_file,
+            tau=tau,
+            servo_voltage=servo_voltage,
+            plot=False,
+            return_logs=True,
+        )
+        metrics = compute_tracking_metrics(logs)
+        print_metrics(f"fs={fs:.1f}Hz", metrics)
+
+        row = {"fs": fs}
+        row.update(metrics)
+        results.append(row)
+
+    df = pd.DataFrame(results)
+
+    plt.figure()
+    plt.plot(df["fs"], df["IAE_total"], marker='o')
+    plt.xlabel("Command sampling fs (Hz)")
+    plt.ylabel("IAE_total (deg·s)")
+    plt.title("IAE vs Command Sampling Rate fs")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("exp_fs_IAE.png")
+    print("Saved IAE vs fs plot to exp_fs_IAE.png")
+
+    return df
+
+
+def experiment_kalman_sweep(kp, ki, kd,
+                            q_list,
+                            r_list,
+                            fs,
+                            samples,
+                            dt,
+                            sim_time,
+                            raw_file="sample_commands.csv",
+                            filt_file="sample_commands_filtered.csv",
+                            tau=tau_default,
+                            servo_voltage=7.4):
+    """
+    Sweep Kalman (q, r) and plot metrics over the grid.
+    """
+    results = []
+
+    # Generate raw commands once
+    raw_cmd_file = generate_samples_commands(fs, samples, filename=raw_file)
+
+    for q in q_list:
+        for r in r_list:
+            filt_cmd_file = apply_kalman_to_commands(
+                in_file=raw_cmd_file,
+                out_file=filt_file,
+                q=q,
+                r=r,
+            )
+
+            logs = simulate(
+                kp, ki, kd,
+                dt=dt,
+                sim_time=sim_time,
+                cmd_file=filt_cmd_file,
+                tau=tau,
+                servo_voltage=servo_voltage,
+                plot=False,
+                return_logs=True,
+            )
+            metrics = compute_tracking_metrics(logs)
+            label = f"q={q}, r={r}"
+            print_metrics(label, metrics)
+
+            row = {"q": q, "r": r}
+            row.update(metrics)
+            results.append(row)
+
+    df = pd.DataFrame(results)
+
+    # Example: heatmap-like scatter of IAE vs q,r
+    plt.figure()
+    scatter = plt.scatter(df["q"], df["r"], c=df["IAE_total"])
+    plt.xlabel("q (process noise)")
+    plt.ylabel("r (measurement noise)")
+    plt.title("IAE_total for Kalman (q,r)")
+    plt.colorbar(scatter, label="IAE_total (deg·s)")
+    plt.tight_layout()
+    plt.savefig("exp_kalman_qr_IAE.png")
+    print("Saved Kalman (q,r) IAE plot to exp_kalman_qr_IAE.png")
+
+    return df
+
+
+## ============================================================
+# MAIN: 
 # ============================================================
 
 if __name__ == "__main__":
-    fs = 10.0       # 10 Hz sampling
-    samples = 500   # 500 time steps
-    generate_samples_commands(fs, samples)
+    # Baseline settings (starting guesses)
+    base_fs = 25.0      # command sampling rate (Hz)
+    base_samples = 500  # number of command samples
+    base_q = 0.01
+    base_r = 1.0
+    base_dt = 0.05
+    base_sim_time = 10.0
+    base_voltage = 7.4
 
-    
-
-    apply_kalman_to_commands(
-        in_file='sample_commands.csv',
-        out_file='sample_commands_filtered.csv',
-        q=0.01,
-        r=1.0,
+    # --------------------------------------------------------
+    # generate commands + Kalman with baseline params
+    # --------------------------------------------------------
+    cmd_file = generate_and_filter_commands(
+        fs=base_fs,
+        samples=base_samples,
+        q=base_q,
+        r=base_r,
+        raw_file="sample_commands.csv",
+        filt_file="sample_commands_filtered.csv",
     )
 
-    print("Tuning PID on continuous first-order servo model")
-    best_kp, best_ki, best_kd = tune_pid()
+    print("\nTuning PID on continuous first-order servo model...")
+    best_kp, best_ki, best_kd = tune_pid_step()
 
-    # base_kp, base_ki, base_kd = tune_pid() 
-
-    # best_kp, best_ki, best_kd = tune_pid_trajectory(base_kp, base_ki, base_kd)
-
-    print("Starting simulate...")
-    simulate(
+    print("\nRunning baseline simulation...")
+    baseline_logs = simulate(
         kp=best_kp,
         ki=best_ki,
         kd=best_kd,
-        dt=0.05,
-        sim_time=10.0,
-        cmd_file='sample_commands_filtered.csv',
-        plot=True,
-        return_logs=False,
-        servo_voltage=7.4,
+        dt=base_dt,
+        sim_time=base_sim_time,
+        cmd_file=cmd_file,
+        tau=tau_default,
+        servo_voltage=base_voltage,
+        plot=False,
+        return_logs=True,
+    )
+    baseline_metrics = compute_tracking_metrics(baseline_logs)
+    print_metrics("Baseline", baseline_metrics)
+
+    # --------------------------------------------------------
+    # run experiments and collect DataFrames
+    # --------------------------------------------------------
+
+    # --- Experiment: servo voltage sweep ---
+    voltage_list = [6.0, 6.7, 7.4]
+    df_voltage = experiment_servo_voltage_sweep(
+        best_kp, best_ki, best_kd,
+        voltage_list=voltage_list,
+        dt=base_dt,
+        sim_time=base_sim_time,
+        cmd_file=cmd_file,
+        tau=tau_default,
     )
 
-    print("Done.")
+    # --- Experiment: command sampling rate fs sweep ---
+    fs_list = [20,22.5,25,27.5,30,32.5, 35, 37.5,40]
+    df_fs = experiment_fs_sweep(
+        best_kp, best_ki, best_kd,
+        fs_list=fs_list,
+        samples=base_samples,
+        q=base_q,
+        r=base_r,
+        dt=base_dt,
+        sim_time=base_sim_time,
+        raw_file="sample_commands.csv",
+        filt_file="sample_commands_filtered.csv",
+        tau=tau_default,
+        servo_voltage=base_voltage,
+    )
+
+    # --- Experiment: Kalman (q,r) sweep ---
+    q_list = [1e-5, 3e-5, 1e-4, 3e-4,
+          1e-3, 3e-3, 1e-2, 3e-2,
+          1e-1]
+
+    r_list = [0.01, 0.03, 0.1, 0.3,
+          1.0, 3.0, 5.0, 10.0]
+    df_kalman = experiment_kalman_sweep(
+        best_kp, best_ki, best_kd,
+        q_list=q_list,
+        r_list=r_list,
+        fs=base_fs,
+        samples=base_samples,
+        dt=base_dt,
+        sim_time=base_sim_time,
+        raw_file="sample_commands.csv",
+        filt_file="sample_commands_filtered.csv",
+        tau=tau_default,
+        servo_voltage=base_voltage,
+    )
+
+    # --------------------------------------------------------
+    #  extract BEST parameters from these experiments
+    # --------------------------------------------------------
+
+    # Best servo voltage
+    idx_v = df_voltage["IAE_total"].idxmin()
+    best_voltage = float(df_voltage.loc[idx_v, "servo_voltage"])
+
+    # Best command sampling fs
+    idx_fs = df_fs["IAE_total"].idxmin()
+    best_fs = float(df_fs.loc[idx_fs, "fs"])
+
+    # Best Kalman q,r
+    idx_k = df_kalman["IAE_total"].idxmin()
+    best_q = float(df_kalman.loc[idx_k, "q"])
+    best_r = float(df_kalman.loc[idx_k, "r"])
+
+    print("\n===== BEST PARAMETERS (voltage, fs, q, r) =====")
+    print(f"  best_fs       = {best_fs:.2f} Hz")
+    print(f"  best_voltage  = {best_voltage:.2f} V")
+    print(f"  best_q        = {best_q}")
+    print(f"  best_r        = {best_r}")
+    print("================================================")
+
+    # --------------------------------------------------------
+    # regenerate commands with best fs, q, r
+    # --------------------------------------------------------
+    best_cmd_file = generate_and_filter_commands(
+        fs=best_fs,
+        samples=base_samples,
+        q=best_q,
+        r=best_r,
+        raw_file="sample_commands_best.csv",
+        filt_file="sample_commands_filtered_best.csv",
+    )
+
+    # --------------------------------------------------------
+    #  dt sweep on this "best-commands" configuration
+    # --------------------------------------------------------
+    dt_list = [0.111, 0.112,0.113,0.114,0.115,0.116, 0.117,0.118,0.119,0.12,0.121,0.122, 0.123,0.124, 0.125]
+    df_dt = experiment_dt_sweep(
+        best_kp, best_ki, best_kd,
+        dt_list=dt_list,
+        sim_time=base_sim_time,
+        cmd_file=best_cmd_file,
+        tau=tau_default,
+        servo_voltage=best_voltage,
+    )
+
+    idx_dt = df_dt["IAE_total"].idxmin()
+    best_dt = float(df_dt.loc[idx_dt, "dt"])
+
+    print("\n===== BEST dt FROM SWEEP =====")
+    print(f"  best_dt       = {best_dt:.3f} s")
+    print("================================")
+
+    # --------------------------------------------------------
+    # Final suim with  optimal params
+    # --------------------------------------------------------
+    print("\nRunning FINAL MAGS simulation with optimal parameters...")
+    final_logs = simulate(
+        kp=best_kp,
+        ki=best_ki,
+        kd=best_kd,
+        dt=best_dt,
+        sim_time=base_sim_time,
+        cmd_file=best_cmd_file,
+        tau=tau_default,
+        servo_voltage=best_voltage,
+        plot=True,
+        return_logs=True,
+    )
+    final_metrics = compute_tracking_metrics(final_logs)
+    print_metrics("Final (optimal)", final_metrics)
+
+    print("\nAll experiments and final optimal simulation complete.")
